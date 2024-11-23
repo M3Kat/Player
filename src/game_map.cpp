@@ -73,8 +73,7 @@ namespace {
 	std::vector<unsigned char> passages_up;
 	std::vector<Game_Event> events;
 	std::vector<Game_CommonEvent> common_events;
-	std::unordered_map<int, MapEventCache> events_cache_by_switch;
-	std::unordered_map<int, MapEventCache> events_cache_by_variable;
+	std::unique_ptr<Game_Map::Caching::MapCache> map_cache;
 
 	std::unique_ptr<lcf::rpg::Map> map;
 
@@ -105,9 +104,6 @@ void Game_Map::OnContinueFromBattle() {
 static Game_Map::Parallax::Params GetParallaxParams();
 
 void Game_Map::Init() {
-	screen_width = (Player::screen_width / 16) * SCREEN_TILE_SIZE;
-	screen_height = (Player::screen_height / 16) * SCREEN_TILE_SIZE;
-
 	Dispose();
 
 	map_info = {};
@@ -115,6 +111,7 @@ void Game_Map::Init() {
 	SetNeedRefresh(true);
 
 	interpreter.reset(new Game_Interpreter_Map(true));
+	map_cache.reset(new Caching::MapCache());
 
 	InitCommonEvents();
 
@@ -135,8 +132,6 @@ void Game_Map::InitCommonEvents() {
 
 void Game_Map::Dispose() {
 	events.clear();
-	events_cache_by_switch.clear();
-	events_cache_by_variable.clear();
 	map.reset();
 	map_info = {};
 	panorama = {};
@@ -146,6 +141,7 @@ void Game_Map::Quit() {
 	Dispose();
 	common_events.clear();
 	interpreter.reset();
+	map_cache.reset();
 }
 
 int Game_Map::GetMapSaveCount() {
@@ -157,8 +153,8 @@ int Game_Map::GetMapSaveCount() {
 void Game_Map::Setup(std::unique_ptr<lcf::rpg::Map> map_in) {
 	Dispose();
 
-	screen_width = (Player::screen_width / 16) * SCREEN_TILE_SIZE;
-	screen_height = (Player::screen_height / 16) * SCREEN_TILE_SIZE;
+	screen_width = (Player::screen_width / 16.0) * SCREEN_TILE_SIZE;
+	screen_height = (Player::screen_height / 16.0) * SCREEN_TILE_SIZE;
 
 	map = std::move(map_in);
 
@@ -292,7 +288,7 @@ void Game_Map::SetupFromSave(
 	Game_Map::Parallax::ChangeBG(GetParallaxParams());
 }
 
-std::unique_ptr<lcf::rpg::Map> Game_Map::loadMapFile(int map_id) {
+std::unique_ptr<lcf::rpg::Map> Game_Map::LoadMapFile(int map_id) {
 	std::unique_ptr<lcf::rpg::Map> map;
 
 	// Try loading EasyRPG map files first, then fallback to normal RPG Maker
@@ -342,48 +338,203 @@ std::unique_ptr<lcf::rpg::Map> Game_Map::loadMapFile(int map_id) {
 
 void Game_Map::SetupCommon() {
 	if (!Tr::GetCurrentTranslationId().empty()) {
-		// Build our map translation id.
-		std::stringstream ss;
-		ss << "map" << std::setfill('0') << std::setw(4) << GetMapId() << ".po";
-
-		// Translate all messages for this map
-		Player::translation.RewriteMapMessages(ss.str(), *map);
+		TranslateMapMessages(GetMapId(), *map);
 	}
 	SetNeedRefresh(true);
 
 	PrintPathToMap();
 
-	// Restart all common events after translation change
-	// Otherwise new strings are not applied
 	if (translation_changed) {
 		InitCommonEvents();
 	}
 
-	// Create the map events
+	map_cache->Clear();
+
+	CreateMapEvents();
+}
+
+void Game_Map::CreateMapEvents() {
 	events.reserve(map->events.size());
 	for (auto& ev : map->events) {
 		events.emplace_back(GetMapId(), &ev);
+		AddEventToCache(ev);
+	}
+}
 
-		for (const auto& pg : ev.pages) {
-			if (pg.condition.flags.switch_a) {
-				AddEventToSwitchCache(ev, pg.condition.switch_a_id);
-			}
-			if (pg.condition.flags.switch_b) {
-				AddEventToSwitchCache(ev, pg.condition.switch_b_id);
-			}
-			if (pg.condition.flags.variable) {
-				AddEventToVariableCache(ev, pg.condition.variable_id);
-			}
+void Game_Map::AddEventToCache(const lcf::rpg::Event& ev) {
+	using Op = Caching::ObservedVarOps;
+
+	for (const auto& pg : ev.pages) {
+		if (pg.condition.flags.switch_a) {
+			map_cache->AddEventAsRefreshTarget<Op::SwitchSet>(pg.condition.switch_a_id, ev);
+		}
+		if (pg.condition.flags.switch_b) {
+			map_cache->AddEventAsRefreshTarget<Op::SwitchSet>(pg.condition.switch_b_id, ev);
+		}
+		if (pg.condition.flags.variable) {
+			map_cache->AddEventAsRefreshTarget<Op::VarSet>(pg.condition.variable_id, ev);
 		}
 	}
 }
 
-void Game_Map::AddEventToSwitchCache(lcf::rpg::Event& ev, int switch_id) {
-	events_cache_by_switch[switch_id].AddEvent(ev);
+void Game_Map::RemoveEventFromCache(const lcf::rpg::Event& ev) {
+	using Op = Caching::ObservedVarOps;
+
+	for (const auto& pg : ev.pages) {
+		if (pg.condition.flags.switch_a) {
+			map_cache->RemoveEventAsRefreshTarget<Op::SwitchSet>(pg.condition.switch_a_id, ev);
+		}
+		if (pg.condition.flags.switch_b) {
+			map_cache->RemoveEventAsRefreshTarget<Op::SwitchSet>(pg.condition.switch_b_id, ev);
+		}
+		if (pg.condition.flags.variable) {
+			map_cache->RemoveEventAsRefreshTarget<Op::VarSet>(pg.condition.variable_id, ev);
+		}
+	}
 }
 
-void Game_Map::AddEventToVariableCache(lcf::rpg::Event& ev, int var_id) {
-	events_cache_by_variable[var_id].AddEvent(ev);
+void Game_Map::Caching::MapCache::Clear() {
+	for (int i = 0; i < static_cast<int>(ObservedVarOps_END); i++) {
+		refresh_targets_by_varid[i].clear();
+	}
+}
+
+bool Game_Map::CloneMapEvent(int src_map_id, int src_event_id, int target_x, int target_y, int target_event_id, StringView target_name) {
+	std::unique_ptr<lcf::rpg::Map> source_map_storage;
+	const lcf::rpg::Map* source_map;
+
+	if (src_map_id == GetMapId()) {
+		source_map = &GetMap();
+	} else {
+		source_map_storage = Game_Map::LoadMapFile(src_map_id);
+		source_map = source_map_storage.get();
+
+		if (source_map_storage == nullptr) {
+			Output::Warning("CloneMapEvent: Invalid source map ID {}", src_map_id);
+			return false;
+		}
+
+		if (!Tr::GetCurrentTranslationId().empty()) {
+			TranslateMapMessages(src_map_id, *source_map_storage);
+		}
+	}
+
+	const lcf::rpg::Event* source_event = FindEventById(source_map->events, src_event_id);
+	if (source_event == nullptr) {
+		Output::Warning("CloneMapEvent: Event ID {} not found on source map {}", src_event_id, src_map_id);
+		return false;
+	}
+
+	lcf::rpg::Event new_event = *source_event;
+	if (target_event_id > 0) {
+		DestroyMapEvent(target_event_id, true);
+		new_event.ID = target_event_id;
+	} else {
+		new_event.ID = GetNextAvailableEventId();
+	}
+	new_event.x = target_x;
+	new_event.y = target_y;
+
+	if (!target_name.empty()) {
+		new_event.name = lcf::DBString(target_name);
+	}
+
+	// sorted insert
+	auto insert_it = map->events.insert(
+		std::upper_bound(map->events.begin(), map->events.end(), new_event, [](const auto& e, const auto& e2) {
+			return e.ID < e2.ID;
+		}), new_event);
+
+	auto game_event = Game_Event(GetMapId(), &*insert_it);
+	events.insert(
+		std::upper_bound(events.begin(), events.end(), game_event, [](const auto& e, const auto& e2) {
+			return e.GetId() < e2.GetId();
+		}), Game_Event(GetMapId(), &*insert_it));
+
+	UpdateUnderlyingEventReferences();
+
+	AddEventToCache(new_event);
+
+	Scene_Map* scene = (Scene_Map*)Scene::Find(Scene::Map).get();
+	scene->spriteset->Refresh();
+	SetNeedRefresh(true);
+
+	return true;
+}
+
+bool Game_Map::DestroyMapEvent(const int event_id, bool from_clone) {
+	const lcf::rpg::Event* event = FindEventById(map->events, event_id);
+
+	if (event == nullptr) {
+		if (!from_clone) {
+			Output::Warning("DestroyMapEvent: Event ID {} not found on current map", event_id);
+		}
+		return true;
+	}
+
+	// Remove event from cache
+	RemoveEventFromCache(*event);
+
+	// Remove event from events vector
+	for (auto it = events.begin(); it != events.end(); ++it) {
+		if (it->GetId() == event_id) {
+			events.erase(it);
+			break;
+		}
+	}
+
+	// Remove event from map
+	for (auto it = map->events.begin(); it != map->events.end(); ++it) {
+		if (it->ID == event_id) {
+			map->events.erase(it);
+			break;
+		}
+	}
+
+	if (!from_clone) {
+		UpdateUnderlyingEventReferences();
+
+		Scene_Map* scene = (Scene_Map*)Scene::Find(Scene::Map).get();
+		scene->spriteset->Refresh();
+		SetNeedRefresh(true);
+	}
+
+	if (GetInterpreter().GetOriginalEventId() == event_id) {
+		// Prevent triggering "invalid event on stack" sanity check
+		GetInterpreter().ClearOriginalEventId();
+	}
+
+	return true;
+}
+
+void Game_Map::TranslateMapMessages(int mapId, lcf::rpg::Map& map) {
+	std::stringstream ss;
+	ss << "map" << std::setfill('0') << std::setw(4) << mapId << ".po";
+	Player::translation.RewriteMapMessages(ss.str(), map);
+}
+
+
+void Game_Map::UpdateUnderlyingEventReferences() {
+	// Update references because modifying the vector can reallocate
+	size_t idx = 0;
+	for (auto& ev : events) {
+		ev.SetUnderlyingEvent(&map->events.at(idx++));
+	}
+
+	Main_Data::game_screen->UpdateUnderlyingEventReferences();
+}
+
+const lcf::rpg::Event* Game_Map::FindEventById(const std::vector<lcf::rpg::Event>& events, int eventId) {
+	for (const auto& ev : events) {
+		if (ev.ID == eventId) {
+			return &ev;
+		}
+	}
+	return nullptr;
+}
+
+int Game_Map::GetNextAvailableEventId() {
+	return map->events.back().ID + 1;
 }
 
 void Game_Map::PrepareSave(lcf::rpg::Save& save) {
@@ -483,7 +634,7 @@ void Game_Map::Scroll(int dx, int dy) {
 // that acc changed by.
 static void ClampingAdd(int low, int high, int& acc, int& inc) {
 	int original_acc = acc;
-	acc = std::max(low, std::min(high, acc + inc));
+	acc = std::clamp(acc + inc, low, high);
 	inc = acc - original_acc;
 }
 
@@ -979,14 +1130,6 @@ int Game_Map::GetTerrainTag(int x, int y) {
 	assert(chip_index < terrain_data.size());
 
 	return terrain_data[chip_index];
-}
-
-void Game_Map::GetEventsXY(std::vector<Game_Event*>& events, int x, int y) {
-	for (Game_Event& ev : GetEvents()) {
-		if (ev.IsInPosition(x, y) && ev.IsActive()) {
-			events.push_back(&ev);
-		}
-	}
 }
 
 Game_Event* Game_Map::GetEventAt(int x, int y, bool require_active) {
@@ -1505,7 +1648,7 @@ void Game_Map::SetPositionX(int x, bool reset_panorama) {
 	if (LoopHorizontal()) {
 		x = Utils::PositiveModulo(x, map_width);
 	} else {
-		x = std::max(0, std::min(map_width - screen_width, x));
+		x = std::clamp(x, 0, map_width - screen_width);
 	}
 	map_info.position_x = x;
 	if (reset_panorama) {
@@ -1527,7 +1670,7 @@ void Game_Map::SetPositionY(int y, bool reset_panorama) {
 	if (LoopVertical()) {
 		y = Utils::PositiveModulo(y, map_height);
 	} else {
-		y = std::max(0, std::min(map_height - screen_height, y));
+		y = std::clamp(y, 0, map_height - screen_height);
 	}
 	map_info.position_y = y;
 	if (reset_panorama) {
@@ -1549,25 +1692,17 @@ void Game_Map::SetNeedRefresh(bool refresh) {
 	need_refresh = refresh;
 }
 
-void MapEventCache::AddEvent(lcf::rpg::Event& ev) {
-	auto id = ev.ID;
-
-	if (std::find(event_ids.begin(), event_ids.end(), id) == event_ids.end()) {
-		event_ids.emplace_back(id);
-	}
-}
-
 void Game_Map::SetNeedRefreshForSwitchChange(int switch_id) {
 	if (need_refresh)
 		return;
-	if (events_cache_by_switch.find(switch_id) != events_cache_by_switch.end())
+	if (map_cache->GetNeedRefresh<Caching::ObservedVarOps::SwitchSet>(switch_id))
 		SetNeedRefresh(true);
 }
 
 void Game_Map::SetNeedRefreshForVarChange(int var_id) {
 	if (need_refresh)
 		return;
-	if (events_cache_by_variable.find(var_id) != events_cache_by_variable.end())
+	if (map_cache->GetNeedRefresh<Caching::ObservedVarOps::VarSet>(var_id))
 		SetNeedRefresh(true);
 }
 
@@ -1759,7 +1894,29 @@ FileRequestAsync* Game_Map::RequestMap(int map_id) {
 	Player::translation.RequestAndAddMap(map_id);
 #endif
 
-	return AsyncHandler::RequestFile(Game_Map::ConstructMapName(map_id, false));
+	auto* request = AsyncHandler::RequestFile(Game_Map::ConstructMapName(map_id, false));
+	request->SetImportantFile(true);
+	return request;
+}
+
+// MapEventCache
+//////////////////
+void Game_Map::Caching::MapEventCache::AddEvent(const lcf::rpg::Event& ev) {
+	auto id = ev.ID;
+
+	if (std::find(event_ids.begin(), event_ids.end(), id) == event_ids.end()) {
+		event_ids.emplace_back(id);
+	}
+}
+
+void Game_Map::Caching::MapEventCache::RemoveEvent(const lcf::rpg::Event& ev) {
+	auto id = ev.ID;
+
+	auto it = std::find(event_ids.begin(), event_ids.end(), id);
+
+	if (it != event_ids.end()) {
+		event_ids.erase(it);
+	}
 }
 
 // Parallax
@@ -1877,19 +2034,19 @@ void Game_Map::Parallax::ResetPositionX() {
 	parallax_fake_x = false;
 
 	if (!params.scroll_horz && !LoopHorizontal()) {
-		int screen_width = Player::screen_width;
+		int pan_screen_width = Player::screen_width;
 		if (Player::game_config.fake_resolution.Get()) {
-			screen_width = SCREEN_TARGET_WIDTH;
+			pan_screen_width = SCREEN_TARGET_WIDTH;
 		}
 
-		int tiles_per_screen = screen_width / TILE_SIZE;
-		if (screen_width % TILE_SIZE != 0) {
+		int tiles_per_screen = pan_screen_width / TILE_SIZE;
+		if (pan_screen_width % TILE_SIZE != 0) {
 			++tiles_per_screen;
 		}
 
-		if (GetTilesX() > tiles_per_screen && parallax_width > screen_width) {
+		if (GetTilesX() > tiles_per_screen && parallax_width > pan_screen_width) {
 			const int w = (GetTilesX() - tiles_per_screen) * TILE_SIZE;
-			const int ph = 2 * std::min(w, parallax_width - screen_width) * map_info.position_x / w;
+			const int ph = 2 * std::min(w, parallax_width - pan_screen_width) * map_info.position_x / w;
 			if (Player::IsRPG2k()) {
 				SetPositionX(ph);
 			} else {
@@ -1915,19 +2072,19 @@ void Game_Map::Parallax::ResetPositionY() {
 	parallax_fake_y = false;
 
 	if (!params.scroll_vert && !Game_Map::LoopVertical()) {
-		int screen_height = Player::screen_height;
+		int pan_screen_height = Player::screen_height;
 		if (Player::game_config.fake_resolution.Get()) {
-			screen_height = SCREEN_TARGET_HEIGHT;
+			pan_screen_height = SCREEN_TARGET_HEIGHT;
 		}
 
-		int tiles_per_screen = screen_height / TILE_SIZE;
-		if (screen_height % TILE_SIZE != 0) {
+		int tiles_per_screen = pan_screen_height / TILE_SIZE;
+		if (pan_screen_height % TILE_SIZE != 0) {
 			++tiles_per_screen;
 		}
 
-		if (GetTilesY() > tiles_per_screen && parallax_height > screen_height) {
+		if (GetTilesY() > tiles_per_screen && parallax_height > pan_screen_height) {
 			const int h = (GetTilesY() - tiles_per_screen) * TILE_SIZE;
-			const int pv = 2 * std::min(h, parallax_height - screen_height) * map_info.position_y / h;
+			const int pv = 2 * std::min(h, parallax_height - pan_screen_height) * map_info.position_y / h;
 			SetPositionY(pv);
 		} else {
 			panorama.pan_y = 0;

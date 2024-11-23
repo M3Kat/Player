@@ -24,7 +24,6 @@
 #include <iomanip>
 #include <fstream>
 #include <memory>
-#include <thread>
 
 #ifdef _WIN32
 #  include "platform/windows/utils.h"
@@ -38,12 +37,14 @@
 #include "cache.h"
 #include "rand.h"
 #include "cmdline_parser.h"
-#include "dynrpg.h"
+#include "game_dynrpg.h"
 #include "filefinder.h"
 #include "filefinder_rtp.h"
 #include "fileext_guesser.h"
+#include "filesystem_hook.h"
 #include "game_actors.h"
 #include "game_battle.h"
+#include "game_destiny.h"
 #include "game_map.h"
 #include "game_message.h"
 #include "game_enemyparty.h"
@@ -229,10 +230,22 @@ void Player::MainLoop() {
 
 	Player::UpdateInput();
 
+	if (!DisplayUi->ProcessEvents()) {
+		Scene::PopUntil(Scene::Null);
+		Player::Exit();
+		return;
+	}
+
 	int num_updates = 0;
 	while (Game_Clock::NextGameTimeStep()) {
 		if (num_updates > 0) {
 			Player::UpdateInput();
+
+			if (!DisplayUi->ProcessEvents()) {
+				Scene::PopUntil(Scene::Null);
+				Player::Exit();
+				return;
+			}
 		}
 
 		Scene::old_instances.clear();
@@ -306,9 +319,6 @@ void Player::UpdateInput() {
 	if (Main_Data::game_quit) {
 		reset_flag |= Main_Data::game_quit->ShouldQuit();
 	}
-
-	// Update Logic:
-	DisplayUi->ProcessEvents();
 }
 
 void Player::Update(bool update_scene) {
@@ -401,7 +411,6 @@ void Player::Exit() {
 #endif
 	Player::ResetGameObjects();
 	Font::Dispose();
-	DynRpg::Reset();
 	Graphics::Quit();
 	Output::Quit();
 	FileFinder::Quit();
@@ -683,6 +692,9 @@ void Player::CreateGameObjects() {
 	}
 	escape_char = Utils::DecodeUTF32(Player::escape_symbol).front();
 
+	// Special handling for games with altered files
+	FileFinder::SetGameFilesystem(HookFilesystem::Detect(FileFinder::Game()));
+
 	// Check for translation-related directories and load language names.
 	translation.InitTranslations();
 
@@ -809,11 +821,15 @@ void Player::CreateGameObjects() {
 
 		if (!FileFinder::Game().FindFile("dynloader.dll").empty()) {
 			game_config.patch_dynrpg.Set(true);
-			Output::Warning("This game uses DynRPG and will not run properly.");
+			Output::Debug("This game uses DynRPG. Depending on the plugins used it will not run properly.");
 		}
 
 		if (!FileFinder::Game().FindFile("accord.dll").empty()) {
 			game_config.patch_maniac.Set(true);
+		}
+
+		if (!FileFinder::Game().FindFile(DESTINY_DLL).empty()) {
+			game_config.patch_destiny.Set(true);
 		}
 	}
 
@@ -825,6 +841,10 @@ void Player::CreateGameObjects() {
 
 	if (Player::IsPatchKeyPatch()) {
 		Main_Data::game_ineluki->ExecuteScriptList(FileFinder::Game().FindFile("autorun.script"));
+	}
+
+	if (Player::IsPatchDestiny()) {
+		Main_Data::game_destiny->Load();
 	}
 }
 
@@ -907,9 +927,9 @@ void Player::ResetGameObjects() {
 	Main_Data::game_quit = std::make_unique<Game_Quit>();
 	Main_Data::game_switches_global = std::make_unique<Game_Switches>();
 	Main_Data::game_variables_global = std::make_unique<Game_Variables>(min_var, max_var);
+	Main_Data::game_dynrpg = std::make_unique<Game_DynRpg>();
 	Main_Data::game_ineluki = std::make_unique<Game_Ineluki>();
-
-	DynRpg::Reset();
+	Main_Data::game_destiny = std::make_unique<Game_Destiny>();
 
 	Game_Clock::ResetFrame(Game_Clock::now());
 
@@ -1071,7 +1091,7 @@ void Player::LoadFonts() {
 }
 
 static void OnMapSaveFileReady(FileRequestResult*, lcf::rpg::Save save) {
-	auto map = Game_Map::loadMapFile(Main_Data::game_player->GetMapId());
+	auto map = Game_Map::LoadMapFile(Main_Data::game_player->GetMapId());
 	Game_Map::SetupFromSave(
 			std::move(map),
 			std::move(save.map_info),
@@ -1149,7 +1169,6 @@ void Player::LoadSavegame(const std::string& save_name, int save_id) {
 	if (!load_on_map) {
 		Scene::PopUntil(Scene::Title);
 	}
-	Game_Map::Dispose();
 
 	Main_Data::game_switches->SetLowerLimit(lcf::Data::switches.size());
 	Main_Data::game_switches->SetData(std::move(save->system.switches));
@@ -1168,18 +1187,26 @@ void Player::LoadSavegame(const std::string& save_name, int save_id) {
 	int map_id = Main_Data::game_player->GetMapId();
 
 	FileRequestAsync* map = Game_Map::RequestMap(map_id);
-	save_request_id = map->Bind([save=std::move(*save)](auto* request) { OnMapSaveFileReady(request, std::move(save)); });
-	map->SetImportantFile(true);
+	save_request_id = map->Bind(
+		[save=std::move(*save), load_on_map, save_id](auto* request) {
+			Game_Map::Dispose();
+
+			OnMapSaveFileReady(request, std::move(save));
+
+			if (load_on_map) {
+				// Increment frame counter for consistency with a normal savegame load
+				IncFrame();
+				static_cast<Scene_Map*>(Scene::instance.get())->StartFromSave(save_id);
+			}
+		}
+	);
 
 	Main_Data::game_system->ReloadSystemGraphic();
 
 	map->Start();
+	// load_on_map is handled in the async callback
 	if (!load_on_map) {
 		Scene::Push(std::make_shared<Scene_Map>(save_id));
-	} else {
-		// Increment frame counter for consistency with a normal savegame load
-		IncFrame();
-		static_cast<Scene_Map*>(Scene::instance.get())->StartFromSave(save_id);
 	}
 }
 
@@ -1221,7 +1248,6 @@ void Player::SetupPlayerSpawn() {
 
 	FileRequestAsync* request = Game_Map::RequestMap(map_id);
 	map_request_id = request->Bind(&OnMapFileReady);
-	request->SetImportantFile(true);
 	request->Start();
 }
 

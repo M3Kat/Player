@@ -82,8 +82,6 @@ libeasyrpg_player_a_SOURCES = \
 	src/drawable_list.h \
 	src/drawable_mgr.cpp \
 	src/drawable_mgr.h \
-	src/dynrpg.cpp \
-	src/dynrpg.h \
 	src/dynrpg_easyrpg.cpp \
 	src/dynrpg_easyrpg.h \
 	src/dynrpg_textplugin.h \
@@ -103,6 +101,8 @@ libeasyrpg_player_a_SOURCES = \
 	src/fileext_guesser.h \
 	src/filesystem.cpp \
 	src/filesystem.h \
+	src/filesystem_hook.cpp \
+	src/filesystem_hook.h \
 	src/filesystem_lzh.cpp \
 	src/filesystem_lzh.h \
 	src/filesystem_native.cpp \
@@ -141,6 +141,10 @@ libeasyrpg_player_a_SOURCES = \
 	src/game_config.h \
 	src/game_config_game.cpp \
 	src/game_config_game.h \
+	src/game_destiny.cpp \
+	src/game_destiny.h \
+	src/game_dynrpg.cpp \
+	src/game_dynrpg.h \
 	src/game_enemy.cpp \
 	src/game_enemy.h \
 	src/game_enemyparty.cpp \
@@ -157,6 +161,8 @@ libeasyrpg_player_a_SOURCES = \
 	src/game_interpreter_control_variables.h \
 	src/game_interpreter_map.cpp \
 	src/game_interpreter_map.h \
+	src/game_interpreter_shared.cpp \
+	src/game_interpreter_shared.h \
 	src/game_map.cpp \
 	src/game_map.h \
 	src/game_message.cpp \
@@ -211,6 +217,8 @@ libeasyrpg_player_a_SOURCES = \
 	src/input_source.h \
 	src/instrumentation.cpp \
 	src/instrumentation.h \
+	src/json_helper.cpp \
+	src/json_helper.h \
 	src/keys.h \
 	src/main_data.cpp \
 	src/main_data.h \
@@ -732,6 +740,7 @@ test_runner_SOURCES = \
 	tests/game_character_flash.cpp \
 	tests/game_character_move.cpp \
 	tests/game_character_moveto.cpp \
+	tests/game_destiny.cpp \
 	tests/game_enemy.cpp \
 	tests/game_event.cpp \
 	tests/game_player_input.cpp \
