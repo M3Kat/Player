@@ -827,13 +827,6 @@ void Game_Player::StartPixelPan(int h, int v, int speed, bool interpolated, bool
 		new_pan_y = GetSpriteY() - v;
 	}
 
-	if (!Game_Map::LoopHorizontal()) {
-		new_pan_x = std::clamp(new_pan_x, 0, Game_Map::GetTilesX() * SCREEN_TILE_SIZE);
-	}
-	if (!Game_Map::LoopVertical()) {
-		new_pan_y = std::clamp(new_pan_y, 0, Game_Map::GetTilesY() * SCREEN_TILE_SIZE);
-	}
-
 	double h_speed;
 	double v_speed;
 
