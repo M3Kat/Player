@@ -882,6 +882,7 @@ bool Game_Interpreter::CommandShowMessage(lcf::rpg::EventCommand const& com) { /
 
 	PendingMessage pm(Game_Message::CommandCodeInserter);
 	pm.SetIsEventMessage(true);
+	pm.SetFromForegroundInterpreter(main_flag);
 
 	// Set first line
 	pm.PushLine(ToString(com.string));
@@ -978,6 +979,7 @@ bool Game_Interpreter::CommandShowChoices(lcf::rpg::EventCommand const& com) { /
 
 	PendingMessage pm(Game_Message::CommandCodeInserter);
 	pm.SetIsEventMessage(true);
+	pm.SetFromForegroundInterpreter(main_flag);
 
 	// Choices setup
 	std::vector<std::string> choices = GetChoices(4);
@@ -1009,6 +1011,7 @@ bool Game_Interpreter::CommandInputNumber(lcf::rpg::EventCommand const& com) { /
 
 	PendingMessage pm(Game_Message::CommandCodeInserter);
 	pm.SetIsEventMessage(true);
+	pm.SetFromForegroundInterpreter(main_flag);
 
 	int variable_id = com.parameters[1];
 	int digits = com.parameters[0];
@@ -1651,6 +1654,7 @@ bool Game_Interpreter::CommandChangeExp(lcf::rpg::EventCommand const& com) { // 
 
 	PendingMessage pm(Game_Message::CommandCodeInserter);
 	pm.SetEnableFace(false);
+	pm.SetFromForegroundInterpreter(main_flag);
 
 	for (const auto& actor : GetActors(com.parameters[0], com.parameters[1])) {
 		actor->ChangeExp(actor->GetExp() + value, show_msg ? &pm : nullptr);
@@ -1681,6 +1685,7 @@ bool Game_Interpreter::CommandChangeLevel(lcf::rpg::EventCommand const& com) { /
 
 	PendingMessage pm(Game_Message::CommandCodeInserter);
 	pm.SetEnableFace(false);
+	pm.SetFromForegroundInterpreter(main_flag);
 
 	for (const auto& actor : GetActors(com.parameters[0], com.parameters[1])) {
 		actor->ChangeLevel(actor->GetLevel() + value, show_msg ? &pm : nullptr);
@@ -3956,6 +3961,7 @@ bool Game_Interpreter::CommandChangeClass(lcf::rpg::EventCommand const& com) { /
 
 	PendingMessage pm(Game_Message::CommandCodeInserter);
 	pm.SetEnableFace(false);
+	pm.SetFromForegroundInterpreter(main_flag);
 
 	const lcf::rpg::Class* cls = lcf::ReaderUtil::GetElement(lcf::Data::classes, class_id);
 	if (!cls && class_id != 0) {
@@ -4547,12 +4553,41 @@ bool Game_Interpreter::CommandManiacKeyInputProcEx(lcf::rpg::EventCommand const&
 	return true;
 }
 
-bool Game_Interpreter::CommandManiacRewriteMap(lcf::rpg::EventCommand const&) {
+bool Game_Interpreter::CommandManiacRewriteMap(lcf::rpg::EventCommand const& com) {
 	if (!Player::IsPatchManiac()) {
 		return true;
 	}
 
-	Output::Warning("Maniac Patch: Command RewriteMap not supported");
+	int mode = com.parameters[0];
+	bool is_replace_range = com.parameters[1] != 0;
+	bool is_upper_layer = com.parameters[2] != 0;
+
+	int tile_index = ValueOrVariableBitfield(mode, 0, com.parameters[3]);
+	int x_start = ValueOrVariableBitfield(mode, 1, com.parameters[4]);
+	int y_start = ValueOrVariableBitfield(mode, 2, com.parameters[5]);
+	int width = ValueOrVariableBitfield(mode, 3, com.parameters[6]);
+	int height = ValueOrVariableBitfield(mode, 4, com.parameters[7]);
+
+	bool disable_autotile = com.parameters[8] != 0;
+
+	Scene_Map* scene = (Scene_Map*)Scene::Find(Scene::Map).get();
+	if (!scene)
+		return true;
+
+	if (is_upper_layer) {
+		for (auto y = y_start; y < y_start + height; ++y) {
+			for (auto x = x_start; x < x_start + width; ++x) {
+				scene->spriteset->ReplaceUpAt(x, y, tile_index);
+			}
+		}
+	} else {
+		for (auto y = y_start; y < y_start + height; ++y) {
+			for (auto x = x_start; x < x_start + width; ++x) {
+				scene->spriteset->ReplaceDownAt(x, y, tile_index, disable_autotile);
+			}
+		}
+	}
+
 	return true;
 }
 
